@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en-AU">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Business Concierge Hub</title>
+<link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+
+<header class="app-header">
+  <button class="drawer-toggle" id="drawerToggle" aria-label="Show or hide the tree">☰</button>
+  <a class="app-brand" href="#/">Business&nbsp;Concierge&nbsp;Hub</a>
+  <span class="pill-status loading" id="statusPill">Loading…</span>
+  <div class="export-wrap">
+    <button class="btn primary" id="exportBtn">⤓&nbsp;<span class="btn-text">Export</span></button>
+    <div class="export-menu" id="exportMenu" hidden>
+      <button data-export="publish">
+        <strong>Publish to GitHub</strong>
+        <span>Content to ProcessHub2-data, the public FAQ to ProcessHub2</span>
+      </button>
+      <button data-export="connect">
+        <strong>GitHub connection…</strong>
+        <span>Your token on this computer · sign out</span>
+      </button>
+      <button data-export="github">
+        <strong>Download the files instead</strong>
+        <span>Four files → data/ and exports/, to commit by hand</span>
+      </button>
+      <button data-export="faq">
+        <strong>FAQ.json only</strong>
+        <span>→ exports/FAQ.json — what the public FAQ page reads</span>
+      </button>
+      <button data-export="verification">
+        <strong>Verification sheet</strong>
+        <span>Every variable, grouped by owning category</span>
+      </button>
+      <button data-export="issues">
+        <strong>Issues report</strong>
+        <span>The register as a readable page</span>
+      </button>
+      <button data-export="coverage">
+        <strong>Categories report</strong>
+        <span>Processes, FAQ answers, fact sheets and variables by category</span>
+      </button>
+      <button data-export="discard" class="danger">
+        <strong>Discard local changes</strong>
+        <span>Reload the published content</span>
+      </button>
+    </div>
+  </div>
+</header>
+
+<div class="conflict-bar" id="conflictBar" hidden></div>
+
+<div class="app-body">
+  <aside class="sidebar" id="sidebar">
+    <div class="section-switch" id="sectionSwitch" role="tablist" aria-label="Section">
+      <button data-section="variables" role="tab">Variables</button>
+      <button data-section="faq" role="tab">FAQ</button>
+      <button data-section="factsheets" role="tab">Fact sheets</button>
+      <button data-section="processes" role="tab">Processes</button>
+      <button data-section="rules" role="tab">Rules</button>
+      <button data-section="issues" role="tab">Issues</button>
+      <button data-section="categories" role="tab">Categories</button>
+      <button data-section="probe" role="tab">Probe</button>
+    </div>
+    <div class="sidebar-search">
+      <input type="search" id="sidebarSearch" placeholder="Search everything…"
+             autocomplete="off" spellcheck="false" aria-label="Search">
+      <kbd class="search-hint">/</kbd>
+    </div>
+    <div class="sidebar-count" id="sidebarCount">—</div>
+    <nav class="sidebar-body">
+      <div id="tree"></div>
+      <div id="searchResults" hidden></div>
+    </nav>
+  </aside>
+
+  <main class="detail" id="detail"></main>
+</div>
+
+<!-- Variable picker, opened from the toolbar of any field being edited -->
+<div class="modal" id="varPicker" hidden>
+  <div class="modal-box">
+    <h3>Insert a variable</h3>
+    <p class="modal-sub">Pick a value to reference. It stays in step with the variable.</p>
+    <input type="search" id="varPickerSearch" placeholder="Search by value or question…"
+           autocomplete="off">
+    <div class="pick-list" id="varPickerList"></div>
+    <div class="modal-actions">
+      <button class="btn" id="varPickerClose">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- Link builder, with the option to point at a URL variable -->
+<div class="modal" id="linkModal" hidden>
+  <div class="modal-box">
+    <h3>Insert link</h3>
+    <div class="fm-field">
+      <label>Link text</label>
+      <input type="text" id="lmText" placeholder="Text to show">
+    </div>
+    <div class="fm-field">
+      <label>Address</label>
+      <div class="lm-choice">
+        <label><input type="radio" name="lmMode" value="url" checked> Type a URL</label>
+        <label><input type="radio" name="lmMode" value="var"> Use a URL variable</label>
+      </div>
+      <input type="text" id="lmUrl" placeholder="https://…">
+      <select id="lmVar"></select>
+    </div>
+    <div class="modal-actions">
+      <button class="btn" id="lmCancel">Cancel</button>
+      <button class="btn primary" id="lmInsert">Insert link</button>
+    </div>
+  </div>
+</div>
+
+<!-- Raising an issue by hand -->
+<div class="modal" id="issueModal" hidden>
+  <div class="modal-box">
+    <h3>Raise an issue</h3>
+    <p class="modal-sub" id="imProcess"></p>
+    <div class="fm-field" id="imPick" hidden>
+      <label for="imFind">What is it about?</label>
+      <input type="search" id="imFind" placeholder="Search processes, FAQ answers, fact sheets, variables" autocomplete="off">
+      <div class="im-find-list" id="imFindList"></div>
+    </div>
+    <div class="fm-field">
+      <label for="imNote">What is wrong or missing?</label>
+      <textarea id="imNote" rows="3"></textarea>
+    </div>
+    <div class="fm-row">
+      <div class="fm-field">
+        <label for="imSeverity">Severity</label>
+        <select id="imSeverity">
+          <option value="high">High</option>
+          <option value="medium">Medium</option>
+          <option value="low">Low</option>
+        </select>
+      </div>
+      <div class="fm-field">
+        <label for="imBy">Raised by</label>
+        <input type="text" id="imBy" placeholder="Your name or team">
+      </div>
+    </div>
+    <div class="fm-field" id="imStepField">
+      <label for="imStep">Which part of the process</label>
+      <select id="imStep"></select>
+    </div>
+    <div class="modal-actions">
+      <button class="btn" id="imCancel">Cancel</button>
+      <button class="btn primary" id="imSave">Raise issue</button>
+    </div>
+  </div>
+</div>
+
+<!-- Attaching a fact sheet or FAQ answer to a step or process, or relating
+     FAQ answers to a fact sheet -->
+<div class="modal" id="attachModal" hidden>
+  <div class="modal-box">
+    <h3>Attach</h3>
+    <p class="modal-sub" id="amWhere"></p>
+    <div class="am-tabs">
+      <button class="am-tab" data-kind="factsheet">📄 Fact sheets</button>
+      <button class="am-tab" data-kind="faq">❓ FAQ answers</button>
+    </div>
+    <input type="search" id="amSearch" placeholder="Search, or pick a suggestion below…"
+           autocomplete="off">
+    <div class="pick-list" id="amList"></div>
+    <div class="modal-actions">
+      <button class="btn" id="amClose">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- Connecting to GitHub: the token stays in this browser only -->
+<div class="modal" id="ghConnectModal" hidden>
+  <div class="modal-box">
+    <h3>GitHub connection</h3>
+    <p class="modal-sub">Business Concierge Hub reads and publishes with a fine-grained personal access
+      token. It is kept in this browser on this computer only — never in the draft, an export
+      or a repository — and is only ever sent to GitHub. Signing out removes it and the local
+      copy of the content.</p>
+    <div class="gh-saved" id="ghSaved" hidden>
+      <span>A token is saved on this computer.</span>
+      <button class="btn small" id="ghTest">Test it</button>
+      <button class="btn small danger" id="ghForget">Sign out of this computer</button>
+    </div>
+    <div class="fm-field">
+      <label for="ghToken">Paste a new token</label>
+      <input type="password" id="ghToken" autocomplete="off" spellcheck="false"
+             placeholder="github_pat_…">
+    </div>
+    <p class="gh-result" id="ghResult" role="status"></p>
+    <details class="gh-help">
+      <summary>Making a token</summary>
+      <ol>
+        <li>On GitHub: <a href="https://github.com/settings/personal-access-tokens/new"
+          target="_blank" rel="noopener">Settings → Developer settings → Fine-grained tokens →
+          Generate new token</a>.</li>
+        <li>Repository access: <strong>Only select repositories → ProcessHub2-data and ProcessHub2</strong>.</li>
+        <li>Permissions: <strong>Contents → Read and write</strong>. Nothing else.</li>
+        <li>An expiry of 90 days is sensible. When it runs out, make a new one and paste it here.</li>
+      </ol>
+    </details>
+    <div class="modal-actions">
+      <button class="btn" id="ghClose">Close</button>
+      <button class="btn primary" id="ghCheck">Check and save</button>
+    </div>
+  </div>
+</div>
+
+<!-- Publishing -->
+<div class="modal" id="publishModal" hidden>
+  <div class="modal-box wide">
+    <h3>Publish to GitHub</h3>
+    <p class="modal-sub">The content goes to <strong id="pubWhere"></strong> (private) as one
+      commit, then the public FAQ.json to <strong id="pubSite"></strong>. Files that have not
+      changed are left alone.</p>
+    <div class="merge-body" id="pubChanges"></div>
+    <div class="fm-field">
+      <label for="pubMessage">Commit message</label>
+      <input type="text" id="pubMessage" autocomplete="off">
+    </div>
+    <p class="gh-result" id="pubStatus" role="status"></p>
+    <div class="modal-actions">
+      <button class="btn small quiet-link" id="pubConnection">GitHub connection…</button>
+      <span class="spacer"></span>
+      <button class="btn" id="pubCancel">Close</button>
+      <button class="btn primary" id="pubGo">Publish</button>
+    </div>
+  </div>
+</div>
+
+<!-- Merging a draft with published files that moved on -->
+<div class="modal" id="mergeModal" hidden>
+  <div class="modal-box wide">
+    <h3>Review and merge</h3>
+    <p class="modal-sub">Item by item: a change made on one side only is taken
+      automatically; a change made on both sides is yours to choose.</p>
+    <div class="merge-body" id="mergeBody"></div>
+    <div class="modal-actions">
+      <button class="btn" id="mergeCancel">Cancel</button>
+      <button class="btn primary" id="mergeApply">Merge</button>
+    </div>
+  </div>
+</div>
+
+<script src="js/github.js"></script>
+<script src="js/gate.js"></script>
+<script src="js/storage.js"></script>
+<script src="js/data.js"></script>
+<script src="js/merge.js"></script>
+<script src="js/edit.js"></script>
+<script src="js/rules.js"></script>
+<script src="js/writing.js"></script>
+<script src="js/checks.js"></script>
+<script src="js/export.js"></script>
+<script src="js/factsheet-export.js"></script>
+<script src="js/faq.js"></script>
+<script src="js/richtext.js"></script>
+<script src="js/canvas.js"></script>
+<script src="js/ui-sidebar.js"></script>
+<script src="js/ui-detail.js"></script>
+<script src="js/semantic.js"></script>
+<script src="js/probe.js"></script>
+<script src="js/ui-probe.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>

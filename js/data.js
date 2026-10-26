@@ -1,0 +1,1057 @@
+/* ===========================================================================
+   data.js — the in-memory model.
+
+   Holds the three source files, builds the lookups the interface needs, and
+   resolves variable references. Everything derived (usage counts, handoffs,
+   the search index) is computed here rather than stored, so it can never fall
+   out of step with the content.
+
+   Derived values live in state.index, never on the content objects
+   themselves. Anything written onto a process or a step would be carried out
+   into processes.json by the next export, and the spec's rule is that derived
+   data is never stored.
+   =========================================================================== */
+
+(function (global) {
+  'use strict';
+
+  var state = {
+    processes: null,
+    library: null,
+    variables: null,
+    index: {}
+  };
+
+  // ---- escaping ------------------------------------------------------------
+
+  function escapeHtml(text) {
+    return String(text == null ? '' : text).replace(/[&<>"']/g, function (ch) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch];
+    });
+  }
+
+  function today() { return new Date().toISOString().slice(0, 10); }
+
+  // ---- variables -----------------------------------------------------------
+
+  var VAR_PATTERN = /\{\{(var_[a-z0-9_]+)\}\}/gi;
+
+  function variable(id) {
+    return state.index.variables[id] || null;
+  }
+
+  function variableChip(id) {
+    var v = variable(id);
+    if (!v) {
+      return '<span class="var-chip missing" title="No variable with the id ' +
+        escapeHtml(id) + '">' + escapeHtml(id) + '</span>';
+    }
+    var classes = 'var-chip' + (v.internal ? ' internal' : '') +
+      (v.status === 'pending' ? ' pending' : '');
+    var tip = v.question || ('Value for ' + v.id);
+    return '<span class="' + classes + '" data-var="' + escapeHtml(v.id) +
+      '" title="' + escapeHtml(tip) + '">' + escapeHtml(v.value) + '</span>';
+  }
+
+  /** Plain text in, safe HTML out, with variables rendered as chips. */
+  function resolveText(text) {
+    return escapeHtml(text).replace(VAR_PATTERN, function (_, id) {
+      return variableChip(id);
+    });
+  }
+
+  /**
+   * HTML in, HTML out, for fact sheets and FAQ answers.
+   *
+   * Two reference styles have to be handled. Process text uses {{var_id}},
+   * while content imported from the published FAQ uses the span form the
+   * council site already renders. Both are refreshed from the variable table
+   * so what you see is the current value rather than whatever was stored.
+   */
+  function resolveHtml(html) {
+    return refreshSpans(toChips(html), 'view');
+  }
+
+  /** The form the rich text editor works in: chips the caret cannot enter. */
+  function editableHtml(html) {
+    return refreshSpans(toChips(html), 'edit');
+  }
+
+  /** The form that gets stored: values synced, editor scaffolding removed. */
+  function canonicalHtml(html) {
+    return refreshSpans(toChips(html), 'canonical');
+  }
+
+  function toChips(html) {
+    return String(html == null ? '' : html)
+      .replace(VAR_PATTERN, function (_, id) { return variableChip(id); });
+  }
+
+  /**
+   * Update <span data-var> text and <a data-var-href> addresses in place.
+   *
+   *   view       chip styling, for reading
+   *   edit       chip styling plus contenteditable="false", so the caret
+   *              cannot land inside a value and break the reference
+   *   canonical  the stored form: value synced, editor scaffolding removed
+   *   bake       plain text, for anything leaving the app
+   */
+  function refreshSpans(html, mode) {
+    if (html.indexOf('data-var') === -1) return html;
+    var holder = document.createElement('div');
+    holder.innerHTML = html;
+
+    Array.prototype.forEach.call(holder.querySelectorAll('[data-var]'), function (node) {
+      var v = variable(node.getAttribute('data-var'));
+      if (!v) return;
+
+      if (mode === 'bake') {
+        node.replaceWith(document.createTextNode(v.value));
+        return;
+      }
+
+      node.textContent = v.value;
+
+      if (mode === 'canonical') {
+        node.className = 'faq-var';
+        node.removeAttribute('contenteditable');
+        node.removeAttribute('title');
+        return;
+      }
+
+      node.className = 'faq-var var-chip' +
+        (v.internal ? ' internal' : '') +
+        (v.status === 'pending' ? ' pending' : '');
+      node.title = v.question || v.id;
+      if (mode === 'edit') node.setAttribute('contenteditable', 'false');
+      else node.removeAttribute('contenteditable');
+    });
+
+    Array.prototype.forEach.call(holder.querySelectorAll('[data-var-href]'), function (node) {
+      var v = variable(node.getAttribute('data-var-href'));
+      if (v) node.setAttribute('href', v.value);
+      if (mode === 'bake') node.removeAttribute('data-var-href');
+    });
+
+    return holder.innerHTML;
+  }
+
+  /** Values baked in, for anything leaving the app (SVG, exports, email). */
+  function freeze(text) {
+    var plain = String(text == null ? '' : text).replace(VAR_PATTERN, function (whole, id) {
+      var v = variable(id);
+      return v ? v.value : whole;
+    });
+    return refreshSpans(plain, 'bake');
+  }
+
+  // ---- indexes -------------------------------------------------------------
+
+  function buildIndexes() {
+    var index = {
+      taxonomy: {},
+      children: {},
+      processes: {},
+      factSheets: {},
+      faqs: {},
+      variables: {},
+      usage: {},
+      flow: {},
+      search: []
+    };
+
+    state.variables.variables.forEach(function (v) { index.variables[v.id] = v; });
+    state.library.factSheets.forEach(function (s) { index.factSheets[s.id] = s; });
+    state.library.faqs.forEach(function (f) { index.faqs[f.id] = f; });
+    index.gaps = {};
+    (state.library.contentGaps || []).forEach(function (g) { index.gaps[g.id] = g; });
+
+    state.processes.taxonomy.forEach(function (node) {
+      index.taxonomy[node.id] = node;
+      var parent = node.parentId || '__root__';
+      (index.children[parent] = index.children[parent] || []).push(node);
+    });
+    Object.keys(index.children).forEach(function (key) {
+      index.children[key].sort(function (a, b) { return (a.order || 0) - (b.order || 0); });
+    });
+
+    // Processes, plus everything derived from them.
+    index.byTaxonomy = {};
+    state.processes.processes.forEach(function (p) {
+      index.processes[p.id] = p;
+      (index.byTaxonomy[p.taxonomyId] = index.byTaxonomy[p.taxonomyId] || []).push(p);
+      index.flow[p.id] = buildFlow(p);
+
+      p.steps.forEach(function (step) {
+        noteUsage(index, step.factSheetRefs, p, step);
+        noteUsage(index, step.faqRefs, p, step);
+        countVariables(index, [step.title, step.sop, step.script, step.completionTrigger, step.timeframe].join('\n'), p, step);
+        (step.checks || []).forEach(function (c) {
+          countVariables(index, c.text, p, step);
+        });
+      });
+      countVariables(index, [p.purpose, p.resolutionDefinition].join('\n'), p, null);
+      (p.connections || []).forEach(function (c) {
+        countVariables(index, c.condition, p, null);
+      });
+      noteUsage(index, p.factSheetRefs, p, null);
+      noteUsage(index, p.faqRefs, p, null);
+    });
+
+    state.library.factSheets.forEach(function (s) {
+      countVariables(index, s.body, s, null);
+      countVariables(index, s.rationale, s, null);
+    });
+    state.library.faqs.forEach(function (f) {
+      countVariables(index, f.a, f, null);
+    });
+
+    Object.keys(index.byTaxonomy).forEach(function (key) {
+      index.byTaxonomy[key].sort(function (a, b) { return a.name.localeCompare(b.name); });
+    });
+
+    index.search = buildSearchIndex(index);
+    state.index = index;
+    return index;
+  }
+
+  /**
+   * The shape of a process as the arrows describe it.
+   *
+   * A handoff is an arrow whose two ends sit in different categories. That
+   * follows the connections rather than the order of the step list, so a
+   * decision that branches into two categories counts both branches.
+   */
+  function buildFlow(p) {
+    var flow = {
+      categories: [],
+      handoffs: 0,
+      handoffSteps: {},
+      outgoing: {},
+      incoming: {},
+      branches: false,
+      linear: true
+    };
+    var byId = {};
+    p.steps.forEach(function (step) {
+      byId[step.id] = step;
+      if (flow.categories.indexOf(step.departmentId) === -1) {
+        flow.categories.push(step.departmentId);
+      }
+    });
+
+    (p.connections || []).forEach(function (c) {
+      var from = byId[c.from], to = byId[c.to];
+      if (!from || !to) return;
+      (flow.outgoing[c.from] = flow.outgoing[c.from] || []).push(c);
+      (flow.incoming[c.to] = flow.incoming[c.to] || []).push(c);
+      if (from.departmentId !== to.departmentId) {
+        flow.handoffs++;
+        flow.handoffSteps[to.id] = from.departmentId;
+      }
+    });
+
+    Object.keys(flow.outgoing).forEach(function (id) {
+      if (flow.outgoing[id].length > 1) flow.branches = true;
+    });
+    flow.linear = isLinear(p);
+    return flow;
+  }
+
+  /** True when the arrows run exactly down the step list, one to the next. */
+  function isLinear(p) {
+    var conns = p.connections || [];
+    if (conns.length !== Math.max(0, p.steps.length - 1)) return false;
+    var pairs = {};
+    conns.forEach(function (c) { pairs[c.from + '>' + c.to] = true; });
+    for (var i = 1; i < p.steps.length; i++) {
+      if (!pairs[p.steps[i - 1].id + '>' + p.steps[i].id]) return false;
+    }
+    return true;
+  }
+
+  function flow(p) {
+    if (!p) return null;
+    return state.index.flow[p.id] || buildFlow(p);
+  }
+
+  function noteUsage(index, refs, owner, step) {
+    (refs || []).forEach(function (id) {
+      var entry = index.usage[id] = index.usage[id] || { processes: [], steps: 0 };
+      if (entry.processes.indexOf(owner.id) === -1) entry.processes.push(owner.id);
+      if (step) entry.steps++;
+    });
+  }
+
+  var SPAN_PATTERN = /data-var(?:-href)?="(var_[a-z0-9_]+)"/gi;
+
+  /**
+   * Count both reference styles. Process text uses {{var_id}}; content from
+   * the published FAQ uses the span form. Missing the second would understate
+   * every FAQ variable as unused, which is exactly the figure the verification
+   * email leans on.
+   */
+  function countVariables(index, text, owner, step) {
+    if (!text) return;
+    [VAR_PATTERN, SPAN_PATTERN].forEach(function (pattern) {
+      var match;
+      pattern.lastIndex = 0;
+      while ((match = pattern.exec(text))) {
+        var entry = index.usage[match[1]] = index.usage[match[1]] || { processes: [], steps: 0 };
+        if (entry.processes.indexOf(owner.id) === -1) entry.processes.push(owner.id);
+        if (step) entry.steps++;
+      }
+    });
+  }
+
+  // ---- search --------------------------------------------------------------
+
+  function buildSearchIndex(index) {
+    var entries = [];
+
+    state.processes.processes.forEach(function (p) {
+      var stepText = p.steps.map(function (s) {
+        return [s.title, s.sop, s.script].join(' ');
+      }).join(' ');
+      entries.push({
+        kind: 'process', id: p.id, title: p.name,
+        subtitle: taxonomyPath(index, p.taxonomyId),
+        haystack: (p.name + ' ' + p.purpose + ' ' + stepText).toLowerCase(),
+        route: '#/process/' + p.id
+      });
+    });
+
+    state.library.factSheets.forEach(function (s) {
+      entries.push({
+        kind: 'factsheet', id: s.id, title: s.title,
+        subtitle: 'Fact sheet · ' + (FACT_SHEET_STATUS_LABEL[s.status] || s.status || 'draft'),
+        haystack: (s.title + ' ' + (s.summary || '') + ' ' + stripTags(s.body)).toLowerCase(),
+        route: '#/factsheet/' + s.id
+      });
+    });
+
+    state.library.faqs.forEach(function (f) {
+      entries.push({
+        kind: 'faq', id: f.id, title: f.q,
+        subtitle: 'FAQ · ' + ((f.publish && f.publish.tabId) || 'not published'),
+        haystack: (f.q + ' ' + stripTags(f.a)).toLowerCase(),
+        route: '#/faq/' + f.id
+      });
+    });
+
+    state.variables.variables.forEach(function (v) {
+      // A raw web address makes a poor result title, so URL variables lead
+      // with the question they answer instead.
+      var title = (v.type === 'url' && v.question) ? v.question : v.value;
+      entries.push({
+        kind: 'variable', id: v.id, title: title,
+        subtitle: (v.type === 'url' ? v.value : v.question),
+        // The source's name is searchable too, so "fees schedule" finds
+        // every value that schedule backs.
+        haystack: (v.value + ' ' + v.question + ' ' + v.id + ' ' +
+          ((v.source && v.source.title) || '')).toLowerCase(),
+        route: '#/variable/' + v.id
+      });
+    });
+
+    return entries;
+  }
+
+  function stripTags(html) {
+    return String(html || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ');
+  }
+
+  /**
+   * What a reader sees of a scrap of HTML, as plain text: tags gone and
+   * entities decoded. Tab labels and FAQ questions are stored as HTML (the
+   * public page renders them that way), so "Waste &amp; Recycling" must show
+   * as "Waste & Recycling" wherever it appears as text.
+   */
+  var decoder = document.createElement('textarea');
+  function plainText(html) {
+    decoder.innerHTML = String(html || '').replace(/<[^>]+>/g, ' ');
+    return decoder.value.replace(/\s+/g, ' ').trim();
+  }
+
+  /**
+   * Matches are ranked so a title hit always beats a body hit — typing "leak"
+   * should surface the leak process, not every answer that mentions one.
+   */
+  function search(query, limit) {
+    var raw = String(query || '').trim().toLowerCase();
+    if (raw.length < 2) return [];
+    var terms = raw.split(/\s+/).filter(Boolean);
+
+    var results = [];
+    state.index.search.forEach(function (entry) {
+      var title = String(entry.title || '').toLowerCase();
+
+      // Every term has to appear somewhere, so "water leak" finds the leak
+      // process even though those two words are never adjacent in it.
+      var everywhere = terms.every(function (t) {
+        return title.indexOf(t) !== -1 || entry.haystack.indexOf(t) !== -1;
+      });
+      if (!everywhere) return;
+
+      var inTitle = terms.filter(function (t) { return title.indexOf(t) !== -1; }).length;
+      var rank;
+      if (title.indexOf(raw) === 0) rank = 0;          // title starts with the phrase
+      else if (title.indexOf(raw) > 0) rank = 1;        // phrase appears in the title
+      else if (inTitle === terms.length) rank = 2;      // all terms in the title
+      else if (inTitle) rank = 3;                       // some terms in the title
+      else rank = 4;                                    // body only
+
+      // A process is usually what someone wants; a variable almost never is,
+      // since it is reference data rather than an answer. Nudge accordingly.
+      rank += { process: 0, faq: 0.3, factsheet: 0.3, variable: 1.5 }[entry.kind] || 0.5;
+      results.push({ entry: entry, rank: rank });
+    });
+
+    results.sort(function (a, b) {
+      return a.rank - b.rank || String(a.entry.title).length - String(b.entry.title).length;
+    });
+    return results.slice(0, limit || 40).map(function (r) { return r.entry; });
+  }
+
+  // ---- suggestions ---------------------------------------------------------
+  // Shared by the editor's attach picker and the live call view: fact sheets
+  // and FAQ answers whose wording overlaps a step (or a fact sheet), scored on
+  // how rare the shared words are.
+
+  var STOPWORDS = ('the a an and or of to in on for with by at from is are was ' +
+    'be been it its this that these those if then when where what which who how ' +
+    'you your we our they their he she them can could should would may might must ' +
+    'will shall do does did not no yes any all some more most other into out up ' +
+    'down over under about after before during while also please note only both ' +
+    'each every such than too very just own same so nor but customer council ' +
+    'officer call caller provide check advise refer ' +
+    // Words that carry no subject at all in council prose, and which were
+    // otherwise pairing unrelated answers together.
+    'make makes made making available need needs needed take takes taken give ' +
+    'given put one two three way ways new old general information details ' +
+    'contact further first second next following include includes including ' +
+    'use used using within via per see back through around member letter ' +
+    'template email phone form forms apply applying required require requires ' +
+    'ensure must may relevant appropriate current existing').split(' ');
+
+  var STOP = {};
+  STOPWORDS.forEach(function (w) { STOP[w] = true; });
+
+  function terms(text) {
+    return String(text || '')
+      // A {{var_sys_property}} reference counts as its value (TechOne), not
+      // as the words "var", "sys" and "property" from its id.
+      .replace(VAR_PATTERN, function (_, id) {
+        var v = variable(id);
+        return v ? ' ' + v.value + ' ' : ' ';
+      })
+      .replace(/<[^>]+>/g, ' ')
+      .toLowerCase()
+      .split(/[^a-z0-9]+/)
+      .filter(function (w) { return w.length > 2 && !STOP[w]; });
+  }
+
+  function unique(list) {
+    var seen = {};
+    return list.filter(function (w) {
+      if (seen[w]) return false;
+      seen[w] = true;
+      return true;
+    });
+  }
+
+  var suggestIndex = null;
+
+  /**
+   * Index the library once per load. Document frequency is kept so that a
+   * word appearing in half the answers counts for much less than a rare one —
+   * without it, "approval" matches everything and nothing useful surfaces.
+   */
+  function buildSuggestIndex() {
+    var docs = [];
+    state.library.factSheets.forEach(function (s) {
+      docs.push({ kind: 'factsheet', id: s.id, title: s.title, body: (s.summary || '') + ' ' + s.body });
+    });
+    state.library.faqs.forEach(function (f) {
+      docs.push({ kind: 'faq', id: f.id, title: f.q, body: f.a });
+    });
+
+    var df = {};
+    docs.forEach(function (doc) {
+      doc.titleTerms = {};
+      unique(terms(doc.title)).forEach(function (w) { doc.titleTerms[w] = true; });
+      doc.allTerms = {};
+      unique(terms(doc.title + ' ' + doc.body)).forEach(function (w) {
+        doc.allTerms[w] = true;
+        df[w] = (df[w] || 0) + 1;
+      });
+    });
+
+    return { docs: docs, df: df, total: docs.length || 1 };
+  }
+
+  // A word in more than a fifth of the library tells you nothing about a
+  // particular step. Without this cutoff, an Airbnb answer surfaces against a
+  // water leak because both mention "sdrc", "lodge" and "whether".
+  var COMMON_TERM_RATIO = 0.2;
+  var RELATIVE_FLOOR = 0.45;
+
+  /**
+   * step may be null, in which case the process as a whole is the query.
+   * kind is 'factsheet' or 'faq'.
+   */
+  function suggest(step, process, kind, alreadyAttached) {
+    var source = step
+      ? [step.title, step.sop, step.script, process.name]
+      : [process.name, process.purpose, process.resolutionDefinition];
+    return suggestFor(source.join(' '), kind, alreadyAttached);
+  }
+
+  /**
+   * The same scoring for any piece of text — a fact sheet looking for the
+   * FAQ answers it expands on, say. Matches whose id is in alreadyAttached
+   * are left out.
+   */
+  function suggestFor(text, kind, alreadyAttached) {
+    if (!suggestIndex) suggestIndex = buildSuggestIndex();
+    var query = unique(terms(text));
+    if (!query.length) return [];
+
+    var taken = {};
+    (alreadyAttached || []).forEach(function (id) { taken[id] = true; });
+
+    var scored = [];
+    suggestIndex.docs.forEach(function (doc) {
+      if (doc.kind !== kind || taken[doc.id]) return;
+
+      var score = 0;
+      var hits = [];
+      query.forEach(function (word) {
+        if (!doc.allTerms[word]) return;
+        var ratio = (suggestIndex.df[word] || 1) / suggestIndex.total;
+        if (ratio > COMMON_TERM_RATIO) return;
+        score += Math.log(1 / ratio) * (doc.titleTerms[word] ? 2.2 : 1);
+        hits.push({ word: word, ratio: ratio });
+      });
+
+      if (hits.length < 2) return;
+      hits.sort(function (a, b) { return a.ratio - b.ratio; });
+      scored.push({ doc: doc, score: score, hits: hits.map(function (h) { return h.word; }) });
+    });
+
+    scored.sort(function (a, b) { return b.score - a.score; });
+    if (!scored.length) return [];
+
+    // Keep only what is in the same league as the best match, so a thin tail
+    // of half-relevant answers does not pad the list out to five.
+    var floor = scored[0].score * RELATIVE_FLOOR;
+    return scored.filter(function (s) { return s.score >= floor; }).slice(0, 5);
+  }
+
+  // ---- helpers -------------------------------------------------------------
+
+  function taxonomyName(id) {
+    var node = state.index.taxonomy[id];
+    return node ? node.name : '—';
+  }
+
+  function taxonomyPath(index, id) {
+    var idx = index || state.index;
+    var node = idx.taxonomy[id];
+    if (!node) return '';
+    var parts = [node.name];
+    var guard = 0;
+    while (node && node.parentId && guard++ < 50) {
+      node = idx.taxonomy[node.parentId];
+      if (node) parts.unshift(node.name);
+    }
+    return parts.join(' › ');
+  }
+
+  /** The top-level category a taxonomy node sits under. */
+  function topDepartment(id) {
+    var node = state.index.taxonomy[id];
+    var guard = 0;
+    while (node && node.parentId && guard++ < 50) node = state.index.taxonomy[node.parentId];
+    return node || null;
+  }
+
+  function processCount(taxonomyId) {
+    var direct = (state.index.byTaxonomy[taxonomyId] || []).length;
+    (state.index.children[taxonomyId] || []).forEach(function (child) {
+      direct += processCount(child.id);
+    });
+    return direct;
+  }
+
+  function isOpen(issue) { return !issue.resolved; }
+
+  /**
+   * Issues can be raised on a process (or one of its steps), an FAQ answer,
+   * a fact sheet or a variable. Each keeps its own issues, in an `issues`
+   * list on the item itself. An owner describes the item an issue is about,
+   * whatever kind it is.
+   *
+   * A content gap is the odd one out: a question the FAQ doesn't answer,
+   * logged from Probe. There is no item for it to sit on, so each gap is
+   * its own issue, kept in library.contentGaps, and its owner is the gap
+   * itself — obj.issues holds just the gap, so everything that reads issues
+   * through an owner (the register, the sidebar, the exports, editing) works
+   * on gaps unchanged.
+   */
+  var ISSUE_KINDS = {
+    process: 'Process', faq: 'FAQ answer', factsheet: 'Fact sheet', variable: 'Variable',
+    gap: 'Content gap'
+  };
+
+  function ownerFrom(kind, obj) {
+    if (kind === 'process') {
+      return { kind: kind, id: obj.id, obj: obj, label: obj.name, taxonomyId: obj.taxonomyId,
+        route: '#/process/' + obj.id };
+    }
+    if (kind === 'faq') {
+      return { kind: kind, id: obj.id, obj: obj, label: plainText(obj.q), taxonomyId: obj.ownerId,
+        route: '#/faq/' + obj.id };
+    }
+    if (kind === 'factsheet') {
+      return { kind: kind, id: obj.id, obj: obj, label: obj.title, taxonomyId: obj.ownerId,
+        route: '#/factsheet/' + obj.id };
+    }
+    if (kind === 'gap') {
+      return { kind: kind, id: obj.id, obj: { issues: [obj] }, gap: obj, label: obj.q,
+        taxonomyId: obj.ownerId, route: '#/probe?gap=' + encodeURIComponent(obj.id) };
+    }
+    return { kind: 'variable', id: obj.id, obj: obj, label: obj.value, taxonomyId: obj.ownerId,
+      route: '#/variable/' + obj.id };
+  }
+
+  /** The process, FAQ answer, fact sheet, variable or content gap with this id, as an owner. */
+  function issueOwner(id) {
+    var idx = state.index;
+    if (idx.processes[id]) return ownerFrom('process', idx.processes[id]);
+    if (idx.faqs[id]) return ownerFrom('faq', idx.faqs[id]);
+    if (idx.factSheets[id]) return ownerFrom('factsheet', idx.factSheets[id]);
+    if (idx.variables[id]) return ownerFrom('variable', idx.variables[id]);
+    if (idx.gaps && idx.gaps[id]) return ownerFrom('gap', idx.gaps[id]);
+    return null;
+  }
+
+  /** Everything that can have issues, as owners. */
+  function issueOwners() {
+    var out = [];
+    state.processes.processes.forEach(function (p) { out.push(ownerFrom('process', p)); });
+    state.library.faqs.forEach(function (f) { out.push(ownerFrom('faq', f)); });
+    state.library.factSheets.forEach(function (sh) { out.push(ownerFrom('factsheet', sh)); });
+    state.variables.variables.forEach(function (v) { out.push(ownerFrom('variable', v)); });
+    (state.library.contentGaps || []).forEach(function (g) { out.push(ownerFrom('gap', g)); });
+    return out;
+  }
+
+  /**
+   * Recorded issues, worst first. Open ones only, unless opts.resolved is
+   * 'include' (everything) or 'only' (the resolved history). Each entry is
+   * { issue, owner } — and `process` too, when it is about a process.
+   */
+  function allIssues(opts) {
+    var mode = (opts && opts.resolved) || 'exclude';
+    var out = [];
+    issueOwners().forEach(function (owner) {
+      (owner.obj.issues || []).forEach(function (issue) {
+        var open = isOpen(issue);
+        if (mode === 'exclude' && !open) return;
+        if (mode === 'only' && open) return;
+        var entry = { issue: issue, owner: owner };
+        if (owner.kind === 'process') entry.process = owner.obj;
+        out.push(entry);
+      });
+    });
+    var weight = { high: 0, medium: 1, low: 2 };
+    out.sort(function (a, b) {
+      if (mode === 'only') return String(b.issue.resolved).localeCompare(String(a.issue.resolved));
+      return (weight[a.issue.severity] || 1) - (weight[b.issue.severity] || 1);
+    });
+    return out;
+  }
+
+  /** The open issues on one item — a process, FAQ answer, fact sheet or variable. */
+  function openIssues(p) {
+    return (p.issues || []).filter(isOpen);
+  }
+
+  // ---- coverage ------------------------------------------------------------
+
+  var STATUSES = ['draft', 'mapped', 'reviewed', 'published', 'needs_rework'];
+
+  var ANSWER_VARS = /data-var(?:-href)?="(var_[a-z0-9_]+)"|\{\{(var_[a-z0-9_]+)\}\}/gi;
+
+  /**
+   * The facts about one FAQ question that the dashboards count: is it on the
+   * public page, is it approved, does a process step link to it, and does its
+   * answer rely on a value nobody has verified yet.
+   */
+  function faqFacts(f) {
+    var usage = state.index.usage[f.id];
+    var unconfirmed = false;
+    var m;
+    ANSWER_VARS.lastIndex = 0;
+    while (!unconfirmed && (m = ANSWER_VARS.exec(f.a || ''))) {
+      var v = variable(m[1] || m[2]);
+      if (v && v.status !== 'current') unconfirmed = true;
+    }
+    return {
+      published: !!(f.publish && f.publish.tabId),
+      ready: f.status === 'published' || f.status === 'approved',
+      linked: !!(usage && usage.processes.length),
+      unconfirmed: unconfirmed
+    };
+  }
+
+  // ---- fact sheets ---------------------------------------------------------
+  // A fact sheet is the longer, public version of what the FAQ answers say:
+  // written here, signed off by the people who have to agree to it, then
+  // handed to comms to publish. Nothing publishes it from Business Concierge Hub.
+
+  var FACT_SHEET_STATUSES = ['draft', 'signoff', 'approved', 'live'];
+  var FACT_SHEET_STATUS_LABEL = {
+    draft: 'Draft', signoff: 'In sign-off', approved: 'Approved', live: 'Live'
+  };
+  var SIGNOFF_LABEL = { pending: 'Waiting', approved: 'Approved', changes: 'Changes requested' };
+
+  /**
+   * The facts the fact sheet dashboard counts: where it is in its life,
+   * how far sign-off has got, whether a process uses it, and whether its
+   * wording leans on a value nobody has verified (or one that must never be
+   * published).
+   */
+  function factSheetFacts(s) {
+    var usage = state.index.usage[s.id];
+    var used = variablesIn(s.body);
+    var people = s.signoffs || [];
+    return {
+      status: FACT_SHEET_STATUSES.indexOf(s.status) === -1 ? 'draft' : s.status,
+      linked: !!(usage && usage.processes.length),
+      unconfirmed: used.filter(function (v) { return v.status !== 'current'; }).length,
+      internal: used.filter(function (v) { return v.internal === true; }).length,
+      unsourced: used.filter(needsSource).length,
+      faqs: (s.faqRefs || []).length,
+      signers: people.length,
+      approvedBy: people.filter(function (x) { return x.decision === 'approved'; }).length,
+      changesFrom: people.filter(function (x) { return x.decision === 'changes'; }).length,
+      replaces: !!String((s.current && (s.current.url || s.current.title)) || '').trim(),
+      rationale: !!plainText(s.rationale)
+    };
+  }
+
+  // ---- public sources ------------------------------------------------------
+  // A variable can name the published document that backs its value:
+  //   source: { title, url, excerpt, checked }
+  // title is the document's name, url where it is, excerpt where in it the
+  // value appears (a page, a section, or the words quoted), and checked the
+  // date someone last saw the document say so. Internal values have no
+  // public source by nature, so they never count as missing one.
+
+  /** True when a variable names a source — a title or a link is enough. */
+  function hasSource(v) {
+    var s = v && v.source;
+    return !!(s && (String(s.title || '').trim() || String(s.url || '').trim()));
+  }
+
+  /** A public variable with no source yet. */
+  function needsSource(v) {
+    return v.internal !== true && !hasSource(v);
+  }
+
+  /**
+   * Every source in use, once each, with the variables that cite it. Two
+   * variables cite the same source when their links match (or, with no
+   * link, their titles). Most-cited first.
+   */
+  function sources() {
+    var byKey = {};
+    var list = [];
+    state.variables.variables.forEach(function (v) {
+      var key = sourceKey(v);
+      if (!key) return;
+      var url = String(v.source.url || '').trim();
+      var title = String(v.source.title || '').trim();
+      if (!byKey[key]) {
+        byKey[key] = { key: key, title: title, url: url, variables: [] };
+        list.push(byKey[key]);
+      }
+      if (!byKey[key].title && title) byKey[key].title = title;
+      byKey[key].variables.push(v);
+    });
+    return list.sort(function (a, b) {
+      return b.variables.length - a.variables.length ||
+        String(a.title || a.url).localeCompare(String(b.title || b.url));
+    });
+  }
+
+  /**
+   * What a variable's source is known by: its link, or with no link its
+   * title, in lower case. '' when it names no source.
+   */
+  function sourceKey(v) {
+    if (!hasSource(v)) return '';
+    return (String(v.source.url || '').trim() || String(v.source.title || '').trim()).toLowerCase();
+  }
+
+  /** One cited source by its key, or null. */
+  function sourceByKey(key) {
+    return sources().find(function (src) { return src.key === key; }) || null;
+  }
+
+  /**
+   * Why a variable can't simply be carried forward when its document is
+   * next updated: not verified, known to be stale, or an open issue on it.
+   * An empty list means it is still correct.
+   */
+  function attentionReasons(v) {
+    var out = [];
+    if (v.status === 'stale') out.push('stale');
+    else if (v.status !== 'current') out.push('not yet verified');
+    var open = openIssues(v).length;
+    if (open) out.push(open + ' open issue' + (open === 1 ? '' : 's'));
+    return out;
+  }
+
+  /** The variables an HTML answer refers to, once each, in order. */
+  function variablesIn(html) {
+    var seen = {};
+    var out = [];
+    var m;
+    ANSWER_VARS.lastIndex = 0;
+    while ((m = ANSWER_VARS.exec(html || ''))) {
+      var id = m[1] || m[2];
+      if (seen[id]) continue;
+      seen[id] = true;
+      var v = variable(id);
+      if (v) out.push(v);
+    }
+    return out;
+  }
+
+  /** Fact sheet figures: how many, and how many are approved or live. */
+  function tallySheets(list) {
+    var out = { total: list.length, approved: 0, signoff: 0 };
+    list.forEach(function (sh) {
+      if (sh.status === 'approved' || sh.status === 'live') out.approved++;
+      if (sh.status === 'signoff') out.signoff++;
+    });
+    return out;
+  }
+
+  /** Variable figures: how many, and how many are verified (current), pending or stale. */
+  function tallyVariables(list) {
+    var out = { total: list.length, current: 0, pending: 0, stale: 0 };
+    list.forEach(function (v) { out[v.status] = (out[v.status] || 0) + 1; });
+    return out;
+  }
+
+  /** FAQ figures for a set of questions. */
+  function tallyFaqs(list) {
+    var out = { total: list.length, published: 0, notReady: 0, linked: 0, unconfirmed: 0 };
+    list.forEach(function (f) {
+      var facts = faqFacts(f);
+      if (facts.published) out.published++;
+      if (!facts.ready) out.notReady++;
+      if (facts.linked) out.linked++;
+      if (facts.unconfirmed) out.unconfirmed++;
+    });
+    return out;
+  }
+
+  /**
+   * How far things have got, category by category. Each row counts the
+   * processes filed under that category and everything beneath it, and the
+   * FAQ answers, fact sheets and variables it (or a subcategory) owns —
+   * with how many are published, approved or verified, the figures that show
+   * progress. Open issues count every issue on any of those.
+   * findingsByProcess, if given, maps a process id to its rule findings.
+   */
+  function coverage(findingsByProcess) {
+    var index = state.index;
+    var rows = [];
+
+    function tally(list) {
+      var out = { processes: list.length, steps: 0, handoffs: 0, issues: 0, high: 0, findings: 0,
+        byStatus: {} };
+      STATUSES.forEach(function (s) { out.byStatus[s] = 0; });
+      list.forEach(function (p) {
+        out.byStatus[p.status] = (out.byStatus[p.status] || 0) + 1;
+        out.steps += p.steps.length;
+        out.handoffs += flow(p).handoffs;
+        var open = openIssues(p);
+        out.issues += open.length;
+        out.high += open.filter(function (i) { return i.severity === 'high'; }).length;
+        out.findings += (findingsByProcess && findingsByProcess[p.id]) || 0;
+      });
+      return out;
+    }
+
+    function beneath(id) {
+      var list = (index.byTaxonomy[id] || []).slice();
+      (index.children[id] || []).forEach(function (child) {
+        list = list.concat(beneath(child.id));
+      });
+      return list;
+    }
+
+    // A category and everything under it, for the FAQ questions it owns.
+    function subtree(id) {
+      var ids = [id];
+      (index.children[id] || []).forEach(function (child) { ids = ids.concat(subtree(child.id)); });
+      return ids;
+    }
+
+    /**
+     * Owned content: FAQ answers, fact sheets and variables, and their open
+     * issues — plus the open content gaps filed under the category, each
+     * of which is an issue in itself.
+     */
+    function owned(row, test) {
+      row.faq = tallyFaqs(state.library.faqs.filter(test));
+      row.sheets = tallySheets(state.library.factSheets.filter(test));
+      row.vars = tallyVariables(state.variables.variables.filter(test));
+      state.library.faqs.concat(state.library.factSheets, state.variables.variables)
+        .filter(test).forEach(function (item) {
+          var open = openIssues(item);
+          row.issues += open.length;
+          row.high += open.filter(function (i) { return i.severity === 'high'; }).length;
+        });
+      (state.library.contentGaps || []).filter(test).forEach(function (g) {
+        if (!isOpen(g)) return;
+        row.issues++;
+        if (g.severity === 'high') row.high++;
+      });
+    }
+
+    function walk(node, depth) {
+      var list = beneath(node.id);
+      var row = tally(list);
+      row.node = node;
+      row.depth = depth;
+      var mine = subtree(node.id);
+      owned(row, function (item) { return mine.indexOf(item.ownerId) !== -1; });
+      rows.push(row);
+      (index.children[node.id] || []).forEach(function (child) { walk(child, depth + 1); });
+    }
+    (index.children.__root__ || []).forEach(function (node) { walk(node, 0); });
+
+    var total = tally(state.processes.processes);
+    owned(total, function () { return true; });
+    total.faqUnowned = state.library.faqs.filter(function (f) {
+      return !f.ownerId || !index.taxonomy[f.ownerId];
+    }).length;
+
+    var owners = {};
+    state.variables.variables.forEach(function (v) {
+      var top = topDepartment(v.ownerId);
+      var key = top ? top.id : '';
+      var o = owners[key] = owners[key] || { ownerId: key, total: 0, current: 0, pending: 0, stale: 0 };
+      o.total++;
+      o[v.status] = (o[v.status] || 0) + 1;
+    });
+
+    return {
+      statuses: STATUSES,
+      rows: rows,
+      total: total,
+      variables: Object.keys(owners).map(function (k) { return owners[k]; })
+        .sort(function (a, b) { return b.total - a.total; })
+    };
+  }
+
+  /**
+   * A readable id, unique within its kind: "fs_" + "Building a New House"
+   * becomes fs_building_a_new_house. Readable ids matter because
+   * they appear in HTML content and in git diffs.
+   */
+  function makeId(prefix, text, taken) {
+    var slug = String(text || '').toLowerCase()
+      .replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 40)
+      .replace(/_+$/, '') || 'item';
+    var id = prefix + slug;
+    var n = 2;
+    while (taken[id]) id = prefix + slug + '_' + n++;
+    return id;
+  }
+
+  /**
+   * Remove anything an older version of the app wrote onto the content by
+   * mistake. Drafts saved before derived values moved into the index still
+   * carry them, and they must not ride out on the next export.
+   */
+  function scrubDerived(processes) {
+    (processes.processes || []).forEach(function (p) {
+      delete p.categories;
+      delete p.handoffs;
+      (p.steps || []).forEach(function (s) { delete s.isHandoff; });
+    });
+  }
+
+  function load(data) {
+    state.processes = data.processes;
+    // Older files predate rules, so normalise rather than assume.
+    if (!Array.isArray(state.processes.rules)) state.processes.rules = [];
+    scrubDerived(state.processes);
+    state.library = data.library;
+    if (!Array.isArray(state.library.factSheets)) state.library.factSheets = [];
+    if (!Array.isArray(state.library.contentGaps)) state.library.contentGaps = [];
+    state.variables = data.variables;
+    suggestIndex = null;
+    buildIndexes();
+    return state;
+  }
+
+  function rebuild() {
+    suggestIndex = null;
+    return buildIndexes();
+  }
+
+  global.Data = {
+    state: state,
+    load: load,
+    rebuild: rebuild,
+    escapeHtml: escapeHtml,
+    today: today,
+    resolveText: resolveText,
+    resolveHtml: resolveHtml,
+    editableHtml: editableHtml,
+    canonicalHtml: canonicalHtml,
+    refreshSpans: refreshSpans,
+    freeze: freeze,
+    variable: variable,
+    search: search,
+    suggest: suggest,
+    flow: flow,
+    isLinear: isLinear,
+    taxonomyName: taxonomyName,
+    taxonomyPath: function (id) { return taxonomyPath(null, id); },
+    topDepartment: topDepartment,
+    processCount: processCount,
+    allIssues: allIssues,
+    openIssues: openIssues,
+    issueOwner: issueOwner,
+    ISSUE_KINDS: ISSUE_KINDS,
+    coverage: coverage,
+    faqFacts: faqFacts,
+    tallyFaqs: tallyFaqs,
+    hasSource: hasSource,
+    needsSource: needsSource,
+    sources: sources,
+    sourceKey: sourceKey,
+    sourceByKey: sourceByKey,
+    attentionReasons: attentionReasons,
+    variablesIn: variablesIn,
+    STATUSES: STATUSES,
+    suggestFor: suggestFor,
+    factSheetFacts: factSheetFacts,
+    FACT_SHEET_STATUSES: FACT_SHEET_STATUSES,
+    FACT_SHEET_STATUS_LABEL: FACT_SHEET_STATUS_LABEL,
+    SIGNOFF_LABEL: SIGNOFF_LABEL,
+    makeId: makeId,
+    stripTags: stripTags,
+    plainText: plainText
+  };
+}(window));
