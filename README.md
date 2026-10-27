@@ -31,11 +31,13 @@ screen instead.
 
 ```
   index.html         the app
-  css/app.css
+  map.html           experimental, staff only: the published FAQ laid out by meaning
+  css/app.css · css/gate.css · css/meaning-map.css
   js/                github.js · gate.js · storage.js · data.js · merge.js · edit.js
                      rules.js · writing.js · checks.js · export.js · factsheet-export.js · faq.js
                      richtext.js · canvas.js
-                     semantic.js · semantic-worker.js · probe.js
+                     semantic.js · semantic-worker.js · probe.js · meaning-map.js · probe-map.js
+                     spot-hint.js
                      ui-sidebar.js · ui-detail.js · ui-probe.js · app.js
   exports/
     FAQ.json         the published FAQ content
@@ -62,6 +64,14 @@ This app keeps everything it stores in the browser under its own names
 they are served from the same address — without either seeing the other's
 token, draft or settings.
 
+**`map.html`** sits behind the same sign-in. It starts hidden and runs only
+once GitHub confirms the token kept in the browser can still read
+ProcessHub2-data; anyone signed in to the app on that computer goes straight
+in. It asks search engines not to index it. What it shows is the public FAQ,
+so the sign-in keeps the tool to staff — it cannot hide the file itself,
+which GitHub Pages serves to anyone who asks for it by name.
+`exports/FAQ.json` stays public.
+
 ## Sections
 
 | Section | What it holds |
@@ -80,6 +90,70 @@ each with subcategories, created with **+ New category** and **+
 Subcategory** and renamed by clicking the name. Variables, FAQ answers and
 fact sheets are filed under one as their owner; a process sits under one;
 each process step names the category that handles it.
+
+## Probe's meaning map
+
+Between the search box and the closest answers, Probe shows the whole FAQ
+laid out by meaning (see *The meaning map* below), drawn from the draft —
+unpublished questions included, as hollow rings:
+
+- A probed question is a **★**, placed among the answers Probe ranked
+  highest, with lines to them (heavier for a higher score). The caption reads
+  the picture: the closest answers sitting together means the model knows
+  what the question is about (and if none scores well, that part of the FAQ
+  has a gap); answers spread across different parts of the map means it
+  can't tell — that is when a search by meaning picks the wrong answer, and
+  an *Also asked as* phrasing on the right answer is the fix.
+- On the dashboard, open content gaps are **◇ diamonds**, each placed among
+  the answers it comes closest to; a patch of them is a topic the FAQ is thin
+  on. Tap one to probe it again.
+- Tap a dot for its question, status and meaning group, with a link to it.
+
+The map waits until every answer has been read, lays itself out once, and
+again only when an FAQ question or answer changes. It needs at least five
+FAQ questions.
+
+## The meaning map (experimental)
+
+`map.html` lays the published FAQ out on one page by meaning: every answer is
+a dot, and answers the model reads as being about the same thing sit close
+together, whatever tab they are on. It is behind the sign-in (see *Signing
+in*), then reads `exports/FAQ.json` and the model in `vendor/`:
+`https://aaronunify2.github.io/ProcessHub2/map.html`. The same map, drawn
+from the draft, is in the Probe section. Both use `js/meaning-map.js`.
+
+Process Hub's map takes ready-made fingerprints from its `ask.html`; this app
+has no `ask.html`, so `map.html` works them out with `js/semantic.js` the
+first time and keeps them in the same browser store as Probe
+(IndexedDB `bchub-vectors`). Anyone who has used Probe on that computer has
+most of them already; after that it opens in a few seconds.
+
+- **Read: Whole answers** averages each question with every passage of its
+  answer; **Questions only** uses the question as Probe reads it.
+- The layout is t-SNE, worked out in the browser and seeded, so the same
+  content gives the same map; **Re-run layout** draws it from another start.
+  Nearness is meaningful, distance across the page is not.
+- **Colour by: Meaning group** shows the model's own grouping (k-means on the
+  fingerprints, ignoring tabs), named after each group's most distinctive words.
+- The side panel lists **possible overlaps** (pairs read as near-identical)
+  and **answers far from their tab** (most of their nearest answers are on
+  other tabs) — candidates for merging or cross-linking.
+- Typing a question loads the model and drops a star where it lands, with
+  lines to the closest answers.
+- **Tap empty space** to ask *what would go here?* — an experiment in
+  wording. The model can only read, not write, so `js/spot-hint.js` makes
+  the suggestions in steps: the spot's fingerprint is estimated by blending
+  the answers around it, nearest counting most; candidate questions are
+  written from the phrases those answers use most and the rest of the FAQ
+  uses least, set into everyday question shapes ("Who do I contact about
+  …?"); and the model keeps the three closest to the spot. The wording is
+  stiff — a glimpse of what the model thinks belongs there, not questions
+  to use. Tap one to place it on the map.
+
+`js/meaning-map.js`, `js/probe-map.js`, `js/spot-hint.js`,
+`css/meaning-map.css` and `css/gate.css` are kept the same as Process Hub's
+(apart from names in comments and captions), so changes can be carried
+between the two.
 
 ## Starting from empty
 

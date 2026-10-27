@@ -12,7 +12,8 @@
      - the model, run in a worker (semantic-worker.js), loaded on first use
      - fingerprints, kept by a hash of the exact text they were made from,
        worked out here and kept in IndexedDB, so each text is read once per
-       browser until it changes
+       browser until it changes; map.html reads and adds to the same
+       store, so the Probe section and the full-page map share the work
      - the scoring helpers: plain text, passages, keywords, a short glossary
 
    =========================================================================== */
@@ -332,6 +333,9 @@
     pack: pack,
     unpack: unpack,
     start: start,
+    loadSaved: loadComputed,
+    embed: embed,
+    keys: function () { return Object.keys(computed); },
     ensure: ensure,
     lookup: lookup,
     vectorOf: vectorOf,
