@@ -4,7 +4,8 @@ Probe (`js/semantic.js`, `js/semantic-worker.js`) matches questions to FAQ
 answers with a small language model that runs in the browser. Everything it
 needs is kept here, in this repository, so the app fetches nothing from
 anyone else's servers and keeps working whatever happens to the original
-sources. Nothing here changes unless someone deliberately replaces it.
+sources. The experimental `map.html` uses the same model, through
+`js/semantic.js`. Nothing here changes unless someone deliberately replaces it.
 
 These are unmodified copies, kept exactly as published.
 

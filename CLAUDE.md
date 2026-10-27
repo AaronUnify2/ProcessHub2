@@ -23,7 +23,7 @@ sense in six months.
 
 **No external dependencies unless asked.** The one exception is `vendor/`:
 unmodified copies of Transformers.js and the all-MiniLM-L6-v2 model for
-Probe, self-hosted so the app depends on no one else's servers. Keep them as
+Probe and `map.html`, self-hosted so the app depends on no one else's servers. Keep them as
 they are; to change them, follow `vendor/README.md`.
 
 **Always produce complete files, not diffs or fragments.** Aaron prefers whole
@@ -35,6 +35,14 @@ files.
 it in a headless browser, with `https://api.github.com/**` routed to a mock
 that serves the data files. Check edge cases and computed results. Say plainly
 if something doesn't work.
+
+## Staff-only pages
+
+`map.html` is an experiment for staff, behind the same sign-in as the app
+(`Gate.require()` in `js/gate.js`). Keep any new page of that kind behind it
+too. The sign-in keeps the tool to staff; it does not hide the files, which
+Pages serves publicly — so never put anything in them that isn't already
+public.
 
 ## Words
 
@@ -49,7 +57,7 @@ between the two apps.
 The app shares an address with Process Hub (`aaronunify2.github.io`), so
 everything it keeps in the browser has its own name: the token
 `bchub.github.token`, preferences `bchub.prefs.v1`, the draft in IndexedDB
-`bchub`, Probe's fingerprints in `bchub-vectors`. Never reuse a `processhub`
+`bchub`, Probe's and map.html's fingerprints in `bchub-vectors`. Never reuse a `processhub`
 name. The token must never be written anywhere else — not the draft, not an
 export, not a log. Never ask Aaron for the token or put one in the
 repository.
